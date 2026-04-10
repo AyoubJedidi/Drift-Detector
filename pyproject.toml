@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drift-detect"
+version = "0.1.0"
+description = "GitOps drift detector for Kubernetes"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.1",
+    "pyyaml>=6.0",
+    "gitpython>=3.1",
+]
+
+[project.scripts]
+drift-detect = "drift_detect.cli:cli"
+
+[tool.setuptools.packages.find]
+where = ["."]

@@ -1,0 +1,2 @@
+[console_scripts]
+drift-detect = drift_detect.cli:cli
