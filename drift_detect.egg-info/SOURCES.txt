@@ -1,8 +1,0 @@
-pyproject.toml
-setup.py
-drift_detect.egg-info/PKG-INFO
-drift_detect.egg-info/SOURCES.txt
-drift_detect.egg-info/dependency_links.txt
-drift_detect.egg-info/entry_points.txt
-drift_detect.egg-info/requires.txt
-drift_detect.egg-info/top_level.txt
