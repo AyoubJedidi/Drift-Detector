@@ -25,6 +25,7 @@ from drift_detect.phase3.differ     import (
     DriftResult,
 )
 from drift_detect.phase3.classifier import classify_result
+from drift_detect.phase3.driftignore import load_driftignore, apply_ignore_rules
 
 
 # ---------------------------------------------------------------------------
@@ -40,6 +41,7 @@ def scan(
     namespace_filter:     Optional[str] = None,
     kind_filter:          Optional[str] = None,
     custom_severity_rules: list = None,
+    driftignore_path:     Optional[Path] = None,
 ) -> List[DriftResult]:
     """
     Run the full drift detection pipeline.
@@ -132,6 +134,10 @@ def scan(
         # Classify severity of each drift item
         classify_result(result, custom_rules=custom_severity_rules)
         results.append(result)
+
+    # Apply .driftignore rules
+    ignore_rules = load_driftignore(driftignore_path)
+    results = apply_ignore_rules(results, ignore_rules)
 
     return results
 
