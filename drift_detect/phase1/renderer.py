@@ -8,6 +8,12 @@ Kubernetes resource dicts — regardless of whether the source is:
   - a Kustomize overlay (rendered via `kustomize build`)
 
 Output is always: List[dict], each dict is one Kubernetes resource.
+
+FIX HISTORY:
+  - _render_helm was passing relative --values paths to a subprocess
+    invoked with cwd=<chart_dir>. helm then resolved the path relative
+    to the chart, not the user's CWD, and failed to find the file.
+    Fix: resolve --values paths to absolute before passing to helm.
 """
 
 import subprocess
@@ -41,7 +47,7 @@ def render(
 
     Raises:
         RuntimeError: If helm/kustomize subprocess fails.
-        ValueError:   If source_type is unrecognized.
+        ValueError:   If source_type is unrecognized or values files are missing.
     """
     if source_type == HELM:
         raw_yaml = _render_helm(directory, helm_values or [])
@@ -60,11 +66,28 @@ def render(
 # ---------------------------------------------------------------------------
 
 def _render_helm(directory: Path, values_files: List[Path]) -> str:
-    """Run `helm template` and return the raw YAML string output."""
+    """
+    Run `helm template` and return the raw YAML string output.
+
+    Values files are resolved to absolute paths before being passed to helm,
+    because the subprocess runs with cwd=<chart_dir>. Without resolution,
+    helm would look for a relative path inside the chart directory.
+    """
     _check_binary("helm")
 
-    cmd = ["helm", "template", "drift-release", str(directory)]
+    # Resolve every --values path to absolute, AND verify it exists with a
+    # clean error message before invoking the subprocess.
+    abs_values = []
     for vf in values_files:
+        abs_path = Path(vf).resolve()
+        if not abs_path.exists():
+            raise ValueError(f"Values file not found: {vf}")
+        if not abs_path.is_file():
+            raise ValueError(f"Values path is not a file: {vf}")
+        abs_values.append(abs_path)
+
+    cmd = ["helm", "template", "drift-release", str(directory)]
+    for vf in abs_values:
         cmd += ["--values", str(vf)]
 
     return _run_subprocess(cmd, cwd=directory, tool="helm")

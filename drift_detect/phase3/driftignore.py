@@ -1,29 +1,3 @@
-"""
-Phase 3 - DriftIgnore
-
-Parses a .driftignore file and filters DriftItems and DriftResults
-based on user-defined ignore rules.
-
-.driftignore format (YAML):
-
-  ignore_fields:
-    - metadata.annotations.argocd.argoproj.io/*
-    - spec.template.metadata.annotations
-
-  ignore_resources:
-    - kind: Job
-      name: db-migration
-      namespace: default
-
-  ignore_labels:
-    - operator.io/*
-
-  ignore_annotations:
-    - argocd.argoproj.io/*
-
-Wildcard * matches any suffix in a path segment.
-"""
-
 import fnmatch
 from pathlib import Path
 from typing import List, Optional
@@ -72,37 +46,47 @@ def load_driftignore(path: Optional[Path] = None) -> DriftIgnoreRules:
     Args:
         path: Path to the .driftignore file.
               If None, looks for .driftignore in the current directory.
-              If file doesn't exist, returns empty rules (no filtering).
+              If file doesn't exist (and was implicit/default), returns empty
+              rules. If file doesn't exist (and was explicit), raises.
 
     Returns:
         DriftIgnoreRules with parsed rules.
+
+    Raises:
+        ValueError: if the file is malformed YAML, structurally wrong, or
+                    cannot be read. The CLI catches this and exits with
+                    code 2 (config error).
     """
     if path is None:
         path = Path(".driftignore")
 
+    # Default-discovery: missing file is fine (no rules to apply)
     if not path.exists():
         return DriftIgnoreRules()
 
- try:
-    content = path.read_text(encoding="utf-8")
-except OSError as e:
-    raise ValueError(f"Cannot read {path}: {e}") from e
+    # Read file
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as e:
+        raise ValueError(f"Cannot read {path}: {e}") from e
 
-try:
-    data = yaml.safe_load(content)
-except yaml.YAMLError as e:
-    raise ValueError(f"Invalid YAML in {path}: {e}") from e
+    # Parse YAML
+    try:
+        data = yaml.safe_load(content)
+    except yaml.YAMLError as e:
+        raise ValueError(f"Invalid YAML in {path}: {e}") from e
 
-# Empty file is valid (yaml.safe_load returns None) — treat as no rules
-if data is None:
-    return DriftIgnoreRules()
+    # Empty file is valid (yaml.safe_load returns None) — treat as no rules
+    if data is None:
+        return DriftIgnoreRules()
 
-# Non-empty but not a mapping — that's a structural error, fail loud
-if not isinstance(data, dict):
-    raise ValueError(
-        f"{path} must contain a YAML mapping at the top level "
-        f"(got {type(data).__name__})"
-    )
+    # Non-empty but wrong shape — structural error, fail loud
+    if not isinstance(data, dict):
+        raise ValueError(
+            f"{path} must contain a YAML mapping at the top level "
+            f"(got {type(data).__name__})"
+        )
+
     return DriftIgnoreRules(
         ignore_fields=data.get("ignore_fields", []),
         ignore_resources=data.get("ignore_resources", []),
