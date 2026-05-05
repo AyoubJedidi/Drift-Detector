@@ -83,17 +83,26 @@ def load_driftignore(path: Optional[Path] = None) -> DriftIgnoreRules:
     if not path.exists():
         return DriftIgnoreRules()
 
-    try:
-        content = path.read_text(encoding="utf-8")
-        data = yaml.safe_load(content)
-    except Exception as e:
-        print(f"Warning: could not parse .driftignore: {e}")
-        return DriftIgnoreRules()
+ try:
+    content = path.read_text(encoding="utf-8")
+except OSError as e:
+    raise ValueError(f"Cannot read {path}: {e}") from e
 
-    if not isinstance(data, dict):
-        print("Warning: .driftignore must be a YAML mapping. Ignoring.")
-        return DriftIgnoreRules()
+try:
+    data = yaml.safe_load(content)
+except yaml.YAMLError as e:
+    raise ValueError(f"Invalid YAML in {path}: {e}") from e
 
+# Empty file is valid (yaml.safe_load returns None) — treat as no rules
+if data is None:
+    return DriftIgnoreRules()
+
+# Non-empty but not a mapping — that's a structural error, fail loud
+if not isinstance(data, dict):
+    raise ValueError(
+        f"{path} must contain a YAML mapping at the top level "
+        f"(got {type(data).__name__})"
+    )
     return DriftIgnoreRules(
         ignore_fields=data.get("ignore_fields", []),
         ignore_resources=data.get("ignore_resources", []),

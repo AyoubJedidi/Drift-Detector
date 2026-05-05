@@ -1,0 +1,16 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-runner
+  namespace: drift-test
+spec:
+  replicas: 1
+  selector:
+    matchLabels: {app: test-runner}
+  template:
+    metadata:
+      labels: {app: test-runner}
+    spec:
+      containers:
+      - name: nginx
+        image: nginx:1.24

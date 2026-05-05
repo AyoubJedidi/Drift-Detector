@@ -1,12 +1,19 @@
-"""
+""""
 Phase 2 - Step 1: Live State Fetcher
 
-Given a list of Kubernetes resources from Phase 1 (each with kind, name, namespace),
-fetches the current live state from the cluster via the Kubernetes API.
+Given a list of Kubernetes resources from Phase 1 (each with kind, name,
+namespace), fetches the current live state from the cluster via the
+Kubernetes API.
+
+Kubeconfig discovery order (when no explicit path is passed):
+  1. Explicit --kubeconfig path (passed to load_cluster_config)
+  2. $KUBECONFIG environment variable
+  3. ~/.kube/config
+  4. In-cluster service account (when running inside a pod — for CronJob mode)
 
 Requires:
   - A reachable cluster
-  - A valid kubeconfig at ~/.kube/config (same one kubectl uses)
+  - A valid kubeconfig (same one kubectl uses) OR in-cluster SA
   - pip install kubernetes
 """
 
@@ -15,6 +22,7 @@ from typing import List, Optional
 
 from kubernetes import client, config
 from kubernetes.client.rest import ApiException
+from kubernetes.config.config_exception import ConfigException
 
 
 # ---------------------------------------------------------------------------
@@ -27,9 +35,9 @@ class ResourceRef:
     A lightweight reference to a Kubernetes resource.
     Built from Phase 1 output — each rendered manifest has these fields.
     """
-    kind:      str
-    name:      str
-    namespace: str
+    kind:        str
+    name:        str
+    namespace:   str
     api_version: str  # e.g. "apps/v1", "v1", "networking.k8s.io/v1"
 
 
@@ -39,23 +47,22 @@ class FetchResult:
     Result of fetching a single resource from the cluster.
 
     status is one of:
-      - "found"               → live object retrieved successfully
-      - "missing_from_cluster"→ resource exists in Git but not in cluster
-      - "unknown_kind"        → we don't know how to fetch this kind (CRD etc.)
-      - "error"               → API call failed unexpectedly
+      - "found"                → live object retrieved successfully
+      - "missing_from_cluster" → resource exists in Git but not in cluster
+      - "unknown_kind"         → we don't know how to fetch this kind (CRD etc.)
+      - "error"                → API call failed unexpectedly
     """
-    ref:        ResourceRef
-    status:     str
+    ref:         ResourceRef
+    status:      str
     live_object: Optional[dict] = field(default=None)
-    error:      Optional[str]   = field(default=None)
+    error:       Optional[str]  = field(default=None)
 
 
 # ---------------------------------------------------------------------------
 # API kind → (api_class, fetch_method) mapping
 # ---------------------------------------------------------------------------
 
-# Maps lowercase kind name to a tuple of:
-#   (api_class_name, method_name)
+# Maps lowercase kind name to (api_class_name, method_name)
 # method_name is the namespaced read method on that API class.
 _KIND_MAP = {
     # Core v1
@@ -90,21 +97,94 @@ _KIND_MAP = {
 
 
 # ---------------------------------------------------------------------------
-# Connection
+# Connection management
 # ---------------------------------------------------------------------------
 
-def load_cluster_config() -> None:
+# Module-level flag so we don't re-load kubeconfig on every fetch call.
+_config_loaded = False
+
+
+def load_cluster_config(
+    kubeconfig: Optional[str] = None,
+    context:    Optional[str] = None,
+) -> None:
     """
-    Load kubeconfig from ~/.kube/config.
-    Raises RuntimeError with a clear message if it fails.
+    Load kubeconfig for the Kubernetes Python client.
+
+    Call this ONCE at CLI startup, before any fetch calls. Repeat calls are
+    no-ops unless force=True (not currently supported — add if needed).
+
+    Args:
+        kubeconfig: Explicit path to a kubeconfig file. If None, falls back
+                    to $KUBECONFIG, then ~/.kube/config, then in-cluster SA.
+        context:    Kubeconfig context name. If None, uses current-context.
+
+    Raises:
+        RuntimeError with a human-readable message on any auth or discovery
+        failure. CLI layer should catch and surface as a ClickException.
+    """
+    global _config_loaded
+    if _config_loaded:
+        return
+
+    # Explicit path wins
+    if kubeconfig:
+        try:
+            config.load_kube_config(config_file=kubeconfig, context=context)
+            _config_loaded = True
+            return
+        except FileNotFoundError:
+            raise RuntimeError(
+                f"Kubeconfig not found at: {kubeconfig}\n"
+                "Check the path or omit --kubeconfig to use the default."
+            )
+        except ConfigException as e:
+            raise RuntimeError(
+                f"Kubeconfig at {kubeconfig} is invalid: {e}\n"
+                "Check the file format or verify --context is correct."
+            )
+
+    # Standard discovery chain: $KUBECONFIG → ~/.kube/config
+    try:
+        config.load_kube_config(context=context)
+        _config_loaded = True
+        return
+    except (ConfigException, FileNotFoundError):
+        # Fall through to in-cluster
+        pass
+
+    # In-cluster fallback (for CronJob / in-pod usage)
+    try:
+        config.load_incluster_config()
+        _config_loaded = True
+        return
+    except ConfigException as e:
+        raise RuntimeError(
+            "Could not load kubeconfig.\n"
+            f"Tried: --kubeconfig, $KUBECONFIG, ~/.kube/config, in-cluster SA.\n"
+            f"Last error: {e}\n"
+            "Tip: run `kubectl get nodes` to verify a cluster is reachable,\n"
+            "or pass --kubeconfig <path> explicitly."
+        )
+
+
+def verify_cluster_reachable() -> None:
+    """
+    Probe the cluster before scanning. Fails fast if unreachable — better
+    UX than failing mid-scan with a confusing API error.
+
+    Raises RuntimeError on connectivity failure.
     """
     try:
-        config.load_kube_config()
+        v1 = client.CoreV1Api()
+        v1.get_api_resources(_request_timeout=5)
     except Exception as e:
         raise RuntimeError(
-            f"Could not load kubeconfig: {e}\n"
-            "Is kubectl configured? Does ~/.kube/config exist?\n"
-            "Tip: run `kubectl get nodes` to verify your cluster is reachable."
+            f"Cannot reach cluster: {e}\n"
+            "Check:\n"
+            "  - kubectl config current-context\n"
+            "  - network connectivity to the API server\n"
+            "  - kubeconfig credentials are not expired"
         )
 
 
@@ -112,17 +192,27 @@ def load_cluster_config() -> None:
 # Main entry point
 # ---------------------------------------------------------------------------
 
-def fetch_live_resources(refs: List[ResourceRef]) -> List[FetchResult]:
+def fetch_live_resources(
+    refs: List[ResourceRef],
+    kubeconfig: Optional[str] = None,
+    context:    Optional[str] = None,
+) -> List[FetchResult]:
     """
     Fetch live state for a list of resource references.
 
     Args:
-        refs: List of ResourceRef built from Phase 1 output.
+        refs:       List of ResourceRef built from Phase 1 output.
+        kubeconfig: Optional explicit kubeconfig path (forwarded to
+                    load_cluster_config if config not yet loaded).
+        context:    Optional kubeconfig context name.
 
     Returns:
         List of FetchResult — one per input ref.
     """
-    load_cluster_config()
+    # Load config on first call (idempotent after that).
+    # If CLI already called load_cluster_config at startup, this is a no-op.
+    load_cluster_config(kubeconfig=kubeconfig, context=context)
+
     api_client = client.ApiClient()
 
     results = []
@@ -192,7 +282,20 @@ def _fetch_one(ref: ResourceRef, api_client: client.ApiClient) -> FetchResult:
     except ApiException as e:
         if e.status == 404:
             return FetchResult(ref=ref, status="missing_from_cluster")
-        # Any other API error
+        if e.status == 403:
+            return FetchResult(
+                ref=ref,
+                status="error",
+                error=f"Forbidden: no permission to read {ref.kind}/{ref.name} "
+                      f"in namespace {ref.namespace}. Check RBAC.",
+            )
+        if e.status == 401:
+            return FetchResult(
+                ref=ref,
+                status="error",
+                error="Unauthorized: credentials expired or invalid. "
+                      "Refresh your kubeconfig token.",
+            )
         return FetchResult(
             ref=ref,
             status="error",

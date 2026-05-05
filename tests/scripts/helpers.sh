@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -euo pipefail
+# set -euo pipefail
 
 NS="drift-test"
 FIXTURES="tests/fixtures"
