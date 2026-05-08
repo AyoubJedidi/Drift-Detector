@@ -9,6 +9,7 @@ Usage:
   drift-detect scan https://github.com/org/repo --branch main
   drift-detect scan ./my-manifests --namespace production --fail-on critical
   drift-detect scan ./my-manifests --output json --quiet
+  drift-detect scan ./my-manifests --snapshot-dir ~/.drift-detect/snaps
 """
 
 import sys
@@ -48,6 +49,8 @@ def cli():
 @click.option("--quiet",        is_flag=True,     help="Print only the summary line.")
 @click.option("--no-color",     is_flag=True,     help="Disable colored output.")
 @click.option("--driftignore",  default=None,     type=click.Path(), help="Path to .driftignore file (default: .driftignore in current dir).")
+@click.option("--snapshot-dir", default=None,     type=click.Path(file_okay=False), help="Directory to write JSON snapshots to. Enables delta tracking against the previous scan of this source.")
+@click.option("--snapshot-retain", default=30, type=click.IntRange(min=0), show_default=True, help="Keep this many most-recent snapshots per source. Older ones are deleted.")
 def scan_cmd(
     source,
     branch,
@@ -61,6 +64,8 @@ def scan_cmd(
     quiet,
     no_color,
     driftignore,
+    snapshot_dir,
+    snapshot_retain,
 ):
     """
     Scan a Git source against a live Kubernetes cluster and report drift.
@@ -77,7 +82,7 @@ def scan_cmd(
 
         helm_values = [Path(v) for v in values] if values else None
 
-        results = scan(
+        scan_result = scan(
             source=source,
             branch=branch,
             tag=tag,
@@ -86,17 +91,19 @@ def scan_cmd(
             namespace_filter=namespace,
             kind_filter=kind,
             driftignore_path=Path(driftignore) if driftignore else None,
+            snapshot_dir=Path(snapshot_dir) if snapshot_dir else None,
+            snapshot_retain=snapshot_retain,
         )
 
         print_results(
-            results,
+            scan_result,
             output_format=output,
             quiet=quiet,
             no_color=no_color,
         )
 
         # Exit code logic
-        if has_drift_above(results, threshold=fail_on):
+        if has_drift_above(scan_result, threshold=fail_on):
             sys.exit(1)
 
     except ValueError as e:

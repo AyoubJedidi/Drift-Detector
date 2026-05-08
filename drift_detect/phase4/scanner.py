@@ -1,31 +1,48 @@
-"""
-Phase 4 - Part 1: Scanner
-
-The main pipeline orchestrator. Calls every phase in order and returns
-a list of DriftResult objects ready for display.
-
-This is the single entry point for the entire tool — the CLI calls this,
-the serve mode calls this, the CI mode calls this.
-
-Nobody else needs to know about resolvers, renderers, fetchers, or normalizers.
-"""
-
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
 from drift_detect.phase1.resolver   import resolve_repo
 from drift_detect.phase1.detector   import resolve_source_type
 from drift_detect.phase1.renderer   import render
-from drift_detect.phase2.fetcher    import build_refs_from_manifests, fetch_live_resources, FetchResult
+from drift_detect.phase2.fetcher    import build_refs_from_manifests, fetch_live_resources
 from drift_detect.phase2.normalizer import normalize_pair
 from drift_detect.phase3.differ     import (
     diff_resource,
     diff_missing_from_cluster,
-    diff_missing_from_git,
     DriftResult,
 )
 from drift_detect.phase3.classifier import classify_result
 from drift_detect.phase3.driftignore import load_driftignore, apply_ignore_rules
+from drift_detect.phase6.snapshot   import (
+    Snapshot,
+    Delta,
+    build_snapshot,
+    save_snapshot,
+    load_previous_snapshot,
+    prune_snapshots,
+    compute_delta,
+)
+
+
+# ---------------------------------------------------------------------------
+# Return type
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScanResult:
+    """
+    Full output of a scan run.
+
+    results:          per-resource drift results from Phase 3
+    delta:            difference vs the previous snapshot, or None if
+                      snapshots weren't enabled for this run
+    snapshot_path:    path to the snapshot file written for this run, or
+                      None if --snapshot-dir wasn't passed
+    """
+    results:        List[DriftResult]      = field(default_factory=list)
+    delta:          Optional[Delta]        = None
+    snapshot_path:  Optional[Path]         = None
 
 
 # ---------------------------------------------------------------------------
@@ -33,16 +50,18 @@ from drift_detect.phase3.driftignore import load_driftignore, apply_ignore_rules
 # ---------------------------------------------------------------------------
 
 def scan(
-    source:               str,
-    branch:               Optional[str] = None,
-    tag:                  Optional[str] = None,
-    source_type_override: Optional[str] = None,
-    helm_values:          Optional[List[Path]] = None,
-    namespace_filter:     Optional[str] = None,
-    kind_filter:          Optional[str] = None,
+    source:                str,
+    branch:                Optional[str] = None,
+    tag:                   Optional[str] = None,
+    source_type_override:  Optional[str] = None,
+    helm_values:           Optional[List[Path]] = None,
+    namespace_filter:      Optional[str] = None,
+    kind_filter:           Optional[str] = None,
     custom_severity_rules: list = None,
-    driftignore_path:     Optional[Path] = None,
-) -> List[DriftResult]:
+    driftignore_path:      Optional[Path] = None,
+    snapshot_dir:          Optional[Path] = None,
+    snapshot_retain:       int = 30,
+) -> ScanResult:
     """
     Run the full drift detection pipeline.
 
@@ -55,9 +74,13 @@ def scan(
         namespace_filter:      Only scan resources in this namespace
         kind_filter:           Only scan resources of this kind
         custom_severity_rules: Override default severity classification
+        driftignore_path:      Path to .driftignore file
+        snapshot_dir:          If provided, save scan + compute delta vs
+                               most recent prior snapshot for this source
+        snapshot_retain:       Keep this many most-recent snapshots per source
 
     Returns:
-        List of DriftResult — one per resource found in Git.
+        ScanResult with results, optional delta, optional snapshot path.
     """
 
     # ------------------------------------------------------------------
@@ -69,7 +92,7 @@ def scan(
 
     if not manifests:
         print("No Kubernetes manifests found in source.")
-        return []
+        return ScanResult()
 
     # ------------------------------------------------------------------
     # Apply filters before hitting the cluster
@@ -87,16 +110,15 @@ def scan(
         ]
 
     if not manifests:
-        print(f"No resources matched the given filters.")
-        return []
+        print("No resources matched the given filters.")
+        return ScanResult()
 
     # ------------------------------------------------------------------
     # Phase 2 — Cluster side
     # ------------------------------------------------------------------
-    refs           = build_refs_from_manifests(manifests)
-    fetch_results  = fetch_live_resources(refs)
+    refs          = build_refs_from_manifests(manifests)
+    fetch_results = fetch_live_resources(refs)
 
-    # Build a lookup: (kind, name, namespace) → git manifest
     git_lookup = {
         (
             m.get("kind", ""),
@@ -120,18 +142,15 @@ def scan(
             result = diff_missing_from_cluster(git_object)
 
         elif fetch_result.status in ("unknown_kind", "error"):
-            # Skip — already warned during fetch
             continue
 
         else:
-            # Resource found — normalize both sides then diff
             norm_git, norm_live = normalize_pair(
                 git_object,
                 fetch_result.live_object,
             )
             result = diff_resource(norm_git, norm_live)
 
-        # Classify severity of each drift item
         classify_result(result, custom_rules=custom_severity_rules)
         results.append(result)
 
@@ -139,16 +158,34 @@ def scan(
     ignore_rules = load_driftignore(driftignore_path)
     results = apply_ignore_rules(results, ignore_rules)
 
-    return results
+    # ------------------------------------------------------------------
+    # Phase 6 — Snapshot + delta (only if --snapshot-dir was passed)
+    # ------------------------------------------------------------------
+    delta:          Optional[Delta] = None
+    snapshot_path:  Optional[Path]  = None
+
+    if snapshot_dir is not None:
+        previous = load_previous_snapshot(source, snapshot_dir)
+        current  = build_snapshot(results, source=source, namespace=namespace_filter)
+        delta    = compute_delta(current, previous)
+
+        snapshot_path = save_snapshot(current, snapshot_dir)
+        prune_snapshots(source, snapshot_dir, retain=snapshot_retain)
+
+    return ScanResult(
+        results=results,
+        delta=delta,
+        snapshot_path=snapshot_path,
+    )
 
 
 # ---------------------------------------------------------------------------
 # Convenience helpers for consumers (CLI, serve mode)
 # ---------------------------------------------------------------------------
 
-def has_drift_above(results: List[DriftResult], threshold: str) -> bool:
+def has_drift_above(scan_result: ScanResult, threshold: str) -> bool:
     """
-    Return True if any result has drift at or above the given severity threshold.
+    Return True if any drift item is at or above the given severity threshold.
 
     Used for exit code logic:
       --fail-on critical  → only exit 1 if critical drift exists
@@ -158,7 +195,7 @@ def has_drift_above(results: List[DriftResult], threshold: str) -> bool:
     order = {"critical": 0, "warning": 1, "info": 2}
     threshold_level = order.get(threshold.lower(), 0)
 
-    for result in results:
+    for result in scan_result.results:
         if result.status not in ("drifted",):
             continue
         for drift in result.drifts:
@@ -168,24 +205,12 @@ def has_drift_above(results: List[DriftResult], threshold: str) -> bool:
     return False
 
 
-def summary_counts(results: List[DriftResult]) -> dict:
+def summary_counts(scan_result: ScanResult) -> dict:
     """
     Return overall counts across all results.
-
-    Returns:
-        {
-            "total":    total resources scanned,
-            "drifted":  resources with drift,
-            "missing_from_cluster": resources in git but not cluster,
-            "missing_from_git":     resources in cluster but not git,
-            "in_sync":  resources with no drift,
-            "critical": total critical drift items,
-            "warning":  total warning drift items,
-            "info":     total info drift items,
-        }
     """
     counts = {
-        "total": len(results),
+        "total": len(scan_result.results),
         "drifted": 0,
         "missing_from_cluster": 0,
         "missing_from_git": 0,
@@ -195,7 +220,7 @@ def summary_counts(results: List[DriftResult]) -> dict:
         "info": 0,
     }
 
-    for result in results:
+    for result in scan_result.results:
         if result.status == "in_sync":
             counts["in_sync"] += 1
         elif result.status == "drifted":
